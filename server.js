@@ -1,33 +1,38 @@
 // server.js
-// mangaruu.com 用 広告除去プロキシ (Render / Node.js 20+)
+// miuraw.net 用 広告除去プロキシ (Render / Node.js 20+)
 import express from 'express';
 import * as cheerio from 'cheerio';
 import { Readable } from 'node:stream';
 
 const PORT = Number(process.env.PORT || 10000);
-const UPSTREAM = new URL(process.env.UPSTREAM || 'https://mangaruu.com');
-const BLOCK_ADS = process.env.BLOCK_ADS !== '0';   // BLOCK_ADS=0 で素通し
+const UPSTREAM = new URL(process.env.UPSTREAM || 'https://miuraw.net');
+const BLOCK_ADS = process.env.BLOCK_ADS !== '0';
+const DIRECT_IMG = process.env.DIRECT_IMG === '1';
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 25000);
 
-// 画像CDNは直リンクのまま（速い・広告なし）
-const DIRECT_IMG_HOSTS = new Set(['i.mangaraw.lat', 'mangaraw.lat']);
+// 画像CDN（サブドメイン含む）
+const IMG_HOST_SUFFIX = (process.env.IMG_HOSTS || 'cdnraw.top').split(',');
+const isImgHost = (h) => IMG_HOST_SUFFIX.some((s) => h === s.trim() || h.endsWith('.' + s.trim()));
 
-// 広告・解析・ポップアップ系ホスト（必要に応じて追記）
+// 広告・解析・ポップアップ系ホスト
 const AD_HOST_RE =
   /(?:^|\.)(?:doubleclick\.net|googlesyndication\.com|google-analytics\.com|googletagmanager\.com|googleadservices\.com|adservice\.google\.[a-z.]+|popads\.net|propellerads\.com|propellerclick\.com|adsterra\.com|highperformanceformat\.com|exoclick\.com|exosrv\.com|juicyads\.com|trafficjunky\.net|hilltopads\.net|onclickalgo\.com|popcash\.net|mgid\.com|taboola\.com|outbrain\.com|cloudflareinsights\.com|histats\.com|monetag\.com|clickadu\.com|a-ads\.com|cointraffic\.io|pushengage\.com|onesignal\.com|amazon-adsystem\.com|adnxs\.com|rubiconproject\.com|pubmatic\.com|criteo\.(?:com|net)|smartadserver\.com|zedo\.com|yieldmo\.com|teads\.tv|vidoomy\.com|adpushup\.com|ezoic\.net|nitropay\.com|venatusmedia\.com|profitableratecpm\.com|adstir\.com|fluct\.com|geniee\.co\.jp|i-mobile\.co\.jp|nend\.net|adingo\.jp|microad\.co\.jp|popin\.cc|logly\.co\.jp|zucks\.net|yandex\.(?:ru|net)|sape\.ru)/i;
 
-// インラインスクリプト内の広告コード判定
-const AD_INLINE_RE =
-  /(adsbygoogle|atOptions|popads|exoclick|propellerads|adsterra|highperformanceformat|juicyads|hilltop|onclickalgo|popcash|monetag|clickadu|a-ads|cointraffic|pushengage|onesignal|histats|metrika|gtag\(|googletagmanager|doubleclick|ezoic|nitropay|window\.open\s*\(|openPopunder)/i;
+// 同一ホスト内でもブロックしたいパス（WP広告プラグイン等）
+const AD_PATH_RE =
+  /\/wp-content\/plugins\/(?:[^/]*(?:ad-inserter|advanced-ads|ads-by|quick-adsense|adsense|adrotate|ezoic|google-site-kit|onesignal|push-?engage|wp-?statistics|site-kit)[^/]*)\//i;
 
-// 実行時に消す広告枠っぽいセレクタ
+// インライン広告コード判定
+const AD_INLINE_RE =
+  /(adsbygoogle|atOptions|popads|exoclick|propellerads|adsterra|highperformanceformat|juicyads|hilltop|onclickalgo|popcash|monetag|clickadu|a-ads|cointraffic|pushengage|onesignal|histats|metrika|gtag\(|googletagmanager|doubleclick|ezoic|nitropay|openPopunder)/i;
+
 const HIDE_CSS = `
   .adsbygoogle, .ad, .ads, .ad-box, .ad-wrap, .ad-wrapper, .ad-container,
   .ad-slot, .ad-area, .ad-banner, .ad-unit, .advert, .advertisement,
-  [class*="advert"], [class*="adsense"], [class*="popunder"], [class*="popunder"],
+  [class*="advert"], [class*="adsense"], [class*="popunder"],
   [id^="google_ads"], [id*="div-gpt-ad"], [data-ad-slot],
   [class*="banner-ad"], [class*="ad-banner"], [class*="ads-box"],
-  [class*="sponsor"], [class*="promo-box"],
+  [class*="sponsor"], [class*="promo-box"], .code-block-1, .code-block-2,
   iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
   iframe[src*="adsterra"], iframe[src*="propellerads"] { display:none !important; }
 `;
@@ -38,68 +43,66 @@ const UA =
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
-app.use(express.raw({ type: '*/*', limit: '20mb' }));
+app.use(express.raw({ type: '*/*', limit: '30mb' }));
 
 const isAdHost = (host) => BLOCK_ADS && AD_HOST_RE.test(host);
-
-function localPath(u) {
-  return u.pathname + u.search + u.hash;
-}
-
-function proxyUrl(absUrl) {
-  return '/__ext?u=' + encodeURIComponent(absUrl);
-}
+const localPath = (u) => u.pathname + u.search + u.hash;
+const proxyUrl = (abs) => '/__ext?u=' + encodeURIComponent(abs);
 
 function stub(res, url) {
   const p = url.pathname.toLowerCase();
-  if (p.endsWith('.css')) {
-    res.set('content-type', 'text/css; charset=utf-8');
-  } else if (/\.(png|jpe?g|gif|webp|avif|svg)$/.test(p)) {
+  if (p.endsWith('.css')) res.set('content-type', 'text/css; charset=utf-8');
+  else if (/\.(png|jpe?g|gif|webp|avif|svg)$/.test(p)) {
     res.set('content-type', 'image/gif');
     return res.end(Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'));
-  } else {
-    res.set('content-type', 'application/javascript; charset=utf-8');
-  }
+  } else res.set('content-type', 'application/javascript; charset=utf-8');
   res.set('cache-control', 'public, max-age=86400');
   res.end('/* blocked by proxy */');
+}
+
+/* Cookie をプロキシホストに付け替える */
+function rewriteSetCookie(list) {
+  return list.map((c) =>
+    c.replace(/;\s*domain=[^;]+/gi, '').replace(/;\s*samesite=none/gi, '; SameSite=Lax')
+  );
 }
 
 /* ---------- クライアント側クリーナー ---------- */
 const CLIENT_JS = String.raw`
 (function () {
-  var UP = 'https://mangaruu.com';
+  var UP = 'https://miuraw.net';
+  var AD = /(doubleclick|googlesyndication|google-analytics|googletagmanager|popads|propellerads|adsterra|exoclick|hilltopads|onclickalgo|popcash|monetag|clickadu|juicyads|mgid|taboola|outbrain|ezoic)/i;
 
-  /* 1. ポップアップ (window.open) を外部ホストなら握り潰す */
+  /* 1. 広告ホストへの window.open だけ潰す（リーダー操作は維持） */
   var nativeOpen = window.open;
   window.open = function (url, name, feat) {
     try {
-      if (!url) return nativeOpen.apply(window, arguments);
-      var u = new URL(url, UP);
-      if (u.hostname !== 'mangaruu.com' && !/mangaraw\.lat$/.test(u.hostname)) return null;
-      return nativeOpen.call(window, u.href, name || '_blank', 'noopener');
-    } catch (e) { return null; }
+      if (url) {
+        var u = new URL(url, UP);
+        if (AD.test(u.hostname)) return null;
+      }
+    } catch (e) {}
+    return nativeOpen.apply(window, arguments);
   };
 
-  /* 2. 広告ブロッカー検出対策のダミー */
+  /* 2. 広告ブロッカー検出対策 */
   window.canRunAds = true;
   window.adsbygoogle = window.adsbygoogle || [];
   window.adsbygoogle.push = function () {};
   window.adsbygoogle.loaded = true;
 
-  /* 3. Service Worker 解除（キャッシュでプロキシを迂回されるのを防ぐ） */
+  /* 3. Service Worker 解除 */
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.getRegistrations()
-      .then(function (rs) { rs.forEach(function (r) { r.unregister(); }); })
-      .catch(function () {});
+      .then(function (rs) { rs.forEach(function (r) { r.unregister(); }); }).catch(function () {});
   }
 
-  /* 4. fetch / XHR の URL をプロキシ経由へ書き換え */
+  /* 4. fetch / XHR の外部URLをプロキシ経由へ */
   var toProxy = function (url) {
     try {
       var u = new URL(url, location.href);
       if (u.origin === location.origin) return url;
-      if (u.hostname === 'mangaruu.com') return u.pathname + u.search;
-      if (/mangaraw\.lat$/.test(u.hostname)) return url;
+      if (u.hostname === 'miuraw.net') return u.pathname + u.search;
       return '/__ext?u=' + encodeURIComponent(u.href);
     } catch (e) { return url; }
   };
@@ -113,12 +116,11 @@ const CLIENT_JS = String.raw`
   }
   var nativeXhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (m, url) {
-    var args = [].slice.call(arguments);
-    args[1] = toProxy(url);
-    return nativeXhrOpen.apply(this, args);
+    var a = [].slice.call(arguments); a[1] = toProxy(url);
+    return nativeXhrOpen.apply(this, a);
   };
 
-  /* 5. 広告ブロッカー検出モーダル / オーバーレイを消す */
+  /* 5. 広告ブロッカー検出モーダルを消す */
   var PHRASES = ['広告ブロッカー', 'AdBlock', 'ad blocker', '広告をブロック'];
   function killNotice() {
     var nodes = document.querySelectorAll('div,section,aside,dialog');
@@ -130,13 +132,13 @@ const CLIENT_JS = String.raw`
       var hit = false;
       for (var j = 0; j < PHRASES.length; j++) if (t.indexOf(PHRASES[j]) !== -1) { hit = true; break; }
       if (!hit) continue;
-      var target = el, cs = getComputedStyle(el);
+      var target = el;
       while (target.parentElement && target.parentElement !== document.body) {
         if (getComputedStyle(target.parentElement).position === 'fixed') target = target.parentElement;
         else break;
       }
-      var tcs = getComputedStyle(target);
-      if (tcs.position === 'fixed' || tcs.position === 'sticky' ||
+      var cs = getComputedStyle(target);
+      if (cs.position === 'fixed' || cs.position === 'sticky' ||
           /modal|popup|overlay|dialog|notice/i.test(target.className || '')) {
         target.dataset.pxKilled = '1';
         target.style.setProperty('display', 'none', 'important');
@@ -144,15 +146,12 @@ const CLIENT_JS = String.raw`
     }
   }
 
-  /* 6. 後から挿入される広告ノードも監視して削除 */
+  /* 6. 後から挿入される広告ノードを監視して削除 */
   var SEL = '.adsbygoogle,.ad,.ads,.ad-box,.ad-wrapper,.ad-container,.advert,[class*="advert"],[id*="div-gpt-ad"],[class*="popunder"],[class*="banner-ad"]';
   function sweep() {
     document.querySelectorAll(SEL).forEach(function (n) { n.style.setProperty('display', 'none', 'important'); });
     document.querySelectorAll('iframe').forEach(function (f) {
-      var s = f.getAttribute('src') || '';
-      if (/doubleclick|googlesyndication|adsterra|propellerads|exoclick|hilltopads/.test(s)) {
-        f.style.setProperty('display', 'none', 'important');
-      }
+      if (AD.test(f.getAttribute('src') || '')) f.style.setProperty('display', 'none', 'important');
     });
     killNotice();
   }
@@ -170,112 +169,87 @@ const CLIENT_JS = String.raw`
 function rewriteHtml(html, base) {
   const $ = cheerio.load(html, { decodeEntities: false });
 
-  // CSP / X-Frame-Options 系メタを除去
   $('meta[http-equiv]').each((_, el) => {
     const eq = ($(el).attr('http-equiv') || '').toLowerCase();
     if (eq.includes('content-security') || eq.includes('x-frame')) $(el).remove();
   });
 
-  // base を無効化
   $('base').attr('href', '/');
 
-  // 外部ホストの資産は /__ext 経由、広告ホストは削除
-  const handleAsset = (el, attr) => {
-    const raw = el.attr(attr);
-    if (!raw) return;
-    let u;
-    try { u = new URL(raw, base); } catch { return; }
-    if (isAdHost(u.hostname)) return el.remove();
-    if (u.hostname === UPSTREAM.hostname) return el.attr(attr, localPath(u));
-    return el.attr(attr, proxyUrl(u.href));
+  const map = (raw) => {
+    const u = new URL(raw, base);
+    if (u.hostname === UPSTREAM.hostname) return localPath(u);
+    if (isImgHost(u.hostname) && DIRECT_IMG) return u.href;
+    return proxyUrl(u.href);
   };
 
-  // script
   $('script[src]').each((_, el) => {
     const $el = $(el);
-    let u;
-    try { u = new URL($el.attr('src'), base); } catch { return $el.remove(); }
+    let u; try { u = new URL($el.attr('src'), base); } catch { return $el.remove(); }
     if (isAdHost(u.hostname)) return $el.remove();
-    $el.removeAttr('integrity').removeAttr('crossorigin');
-    $el.attr('src', u.hostname === UPSTREAM.hostname ? localPath(u) : proxyUrl(u.href));
+    if (u.hostname === UPSTREAM.hostname && AD_PATH_RE.test(u.pathname)) return $el.remove();
+    $el.removeAttr('integrity').removeAttr('crossorigin').attr('src', map(u.href));
   });
 
-  // インライン広告スクリプト
   $('script:not([src])').each((_, el) => {
-    const code = $(el).html() || '';
-    if (AD_INLINE_RE.test(code)) $(el).remove();
+    if (AD_INLINE_RE.test($(el).html() || '')) $(el).remove();
   });
 
-  // 広告 iframe
   $('iframe').each((_, el) => {
     const $el = $(el);
-    let u;
-    try { u = new URL($el.attr('src') || '', base); } catch { return; }
+    let u; try { u = new URL($el.attr('src') || '', base); } catch { return; }
     if (isAdHost(u.hostname)) return $el.remove();
-    $el.attr('src', u.hostname === UPSTREAM.hostname ? localPath(u) : proxyUrl(u.href));
+    $el.attr('src', map(u.href));
   });
 
-  // link (css / preload)
   $('link[href]').each((_, el) => {
     const $el = $(el);
     const rel = ($el.attr('rel') || '').toLowerCase();
     if (rel.includes('manifest') || rel.includes('alternate')) return;
-    $el.removeAttr('integrity').removeAttr('crossorigin');
-    handleAsset($el, 'href');
+    let u; try { u = new URL($el.attr('href'), base); } catch { return; }
+    if (isAdHost(u.hostname)) return $el.remove();
+    if (u.hostname === UPSTREAM.hostname && AD_PATH_RE.test(u.pathname)) return $el.remove();
+    $el.removeAttr('integrity').removeAttr('crossorigin').attr('href', map(u.href));
   });
 
-  // 画像
-  const IMG_ATTRS = ['src', 'data-src', 'data-original', 'data-lazy-src', 'data-echo', 'poster'];
+  const IMG_ATTRS = ['src', 'data-src', 'data-original', 'data-lazy-src', 'data-echo', 'data-url', 'poster'];
   $('img,source,video').each((_, el) => {
     const $el = $(el);
     IMG_ATTRS.forEach((a) => {
       const raw = $el.attr(a);
-      if (!raw) return;
-      let u;
-      try { u = new URL(raw, base); } catch { return; }
-      if (DIRECT_IMG_HOSTS.has(u.hostname)) return $el.attr('referrerpolicy', 'no-referrer');
-      if (u.hostname === UPSTREAM.hostname) return $el.attr(a, localPath(u));
-      if (isAdHost(u.hostname)) return $el.remove();
-      return $el.attr(a, proxyUrl(u.href));
+      if (!raw || raw.startsWith('data:')) return;
+      let u; try { u = new URL(raw, base); } catch { return; }
+      if (isAdHost(u.hostname)) return;
+      $el.attr(a, map(u.href));
+      if (isImgHost(u.hostname) && DIRECT_IMG) $el.attr('referrerpolicy', 'no-referrer');
     });
     const ss = $el.attr('srcset');
     if (ss) {
-      $el.attr('srcset', ss.split(',').map((part) => {
-        const [url, desc] = part.trim().split(/\s+/);
-        try {
-          const u = new URL(url, base);
-          const out = u.hostname === UPSTREAM.hostname ? localPath(u) : proxyUrl(u.href);
-          return desc ? out + ' ' + desc : out;
-        } catch { return part.trim(); }
+      $el.attr('srcset', ss.split(',').map((p) => {
+        const [url, desc] = p.trim().split(/\s+/);
+        try { const o = map(new URL(url, base).href); return desc ? o + ' ' + desc : o; } catch { return p.trim(); }
       }).join(', '));
     }
   });
 
-  // リンク
   $('a[href]').each((_, el) => {
     const $el = $(el);
-    let u;
-    try { u = new URL($el.attr('href'), base); } catch { return; }
+    let u; try { u = new URL($el.attr('href'), base); } catch { return; }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
-    if (u.hostname === UPSTREAM.hostname) {
-      $el.attr('href', localPath(u));
-    } else {
-      $el.attr('href', u.href).attr('target', '_blank').attr('rel', 'noopener noreferrer');
+    if (u.hostname === UPSTREAM.hostname) $el.attr('href', localPath(u));
+    else $el.attr('href', u.href).attr('target', '_blank').attr('rel', 'noopener noreferrer');
+  });
+
+  // onclick は残す。広告系トークンのときだけ削除
+  $('[onclick]').each((_, el) => {
+    const $el = $(el);
+    if (/popunder|adsterra|onclickalgo|propellerads|popads|exoclick/i.test($el.attr('onclick') || '')) {
+      $el.removeAttr('onclick');
     }
   });
 
-  // インライン onclick のポップアップを無効化
-  $('[onclick]').each((_, el) => {
-    const $el = $(el);
-    const oc = $el.attr('onclick') || '';
-    if (/window\.open|popunder/i.test(oc)) $el.removeAttr('onclick');
-  });
-
-  // 注入
   $('head').prepend('<style id="px-hide">' + HIDE_CSS + '</style>');
-  $('body').prepend(
-    '<div class="adsbygoogle ad adsbox" style="position:absolute;left:-9999px;top:0;width:300px;height:250px"></div>'
-  );
+  $('body').prepend('<div class="adsbygoogle ad adsbox" style="position:absolute;left:-9999px;top:0;width:300px;height:250px"></div>');
   $('body').append('<script id="px-clean">' + CLIENT_JS + '</script>');
 
   return $.html();
@@ -285,8 +259,7 @@ function rewriteHtml(html, base) {
 async function handleExt(req, res) {
   const raw = req.query.u;
   if (!raw) return res.status(400).send('missing u');
-  let u;
-  try { u = new URL(raw); } catch { return res.status(400).send('bad u'); }
+  let u; try { u = new URL(raw); } catch { return res.status(400).send('bad u'); }
   if (isAdHost(u.hostname)) return stub(res, u);
 
   const ctrl = new AbortController();
@@ -297,7 +270,7 @@ async function handleExt(req, res) {
         'user-agent': UA,
         accept: req.headers.accept || '*/*',
         'accept-encoding': 'gzip, deflate, br',
-        referer: UPSTREAM.origin + '/',
+        referer: UPSTREAM.origin + '/',   // 画像CDNのホットリンク対策
       },
       redirect: 'follow',
       signal: ctrl.signal,
@@ -310,9 +283,7 @@ async function handleExt(req, res) {
     Readable.fromWeb(r.body).pipe(res);
   } catch {
     res.status(502).send('upstream error');
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 }
 
 /* ---------- メイン ---------- */
@@ -321,15 +292,8 @@ app.all('*', async (req, res) => {
   if (req.path === '/__ext') return handleExt(req, res);
 
   let target;
-  try {
-    target = new URL(req.originalUrl, UPSTREAM);
-  } catch {
-    return res.status(400).send('bad url');
-  }
-  if (target.hostname !== UPSTREAM.hostname) {
-    return res.redirect(302, target.href);
-  }
-  if (isAdHost(target.hostname)) return stub(res, target);
+  try { target = new URL(req.originalUrl, UPSTREAM); } catch { return res.status(400).send('bad url'); }
+  if (target.hostname !== UPSTREAM.hostname) return res.redirect(302, target.href);
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
@@ -339,8 +303,9 @@ app.all('*', async (req, res) => {
     accept: req.headers.accept || 'text/html,application/xhtml+xml,*/*',
     'accept-language': 'ja,en-US;q=0.8,en;q=0.6',
     'accept-encoding': 'gzip, deflate, br',
-    referer: UPSTREAM.origin + '/',
+    referer: req.method === 'GET' ? UPSTREAM.origin + '/' : target.href,
   };
+  if (req.headers.cookie) headers.cookie = req.headers.cookie;   // WP セッション維持
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.body?.length) {
     headers['content-type'] = req.headers['content-type'] || 'application/octet-stream';
   }
@@ -354,12 +319,13 @@ app.all('*', async (req, res) => {
       signal: ctrl.signal,
     });
 
-    // リダイレクトをプロキシ内に閉じ込める
+    const setCookies = r.headers.getSetCookie?.() || [];
+    if (setCookies.length) res.set('set-cookie', rewriteSetCookie(setCookies));
+
     if (r.status >= 300 && r.status < 400) {
       const loc = r.headers.get('location');
       if (!loc) return res.sendStatus(r.status);
-      let lu;
-      try { lu = new URL(loc, target); } catch { return res.redirect(302, loc); }
+      let lu; try { lu = new URL(loc, target); } catch { return res.redirect(302, loc); }
       if (lu.hostname === UPSTREAM.hostname) return res.redirect(302, localPath(lu));
       if (isAdHost(lu.hostname)) return res.redirect(302, localPath(target));
       return res.redirect(302, proxyUrl(lu.href));
@@ -379,11 +345,9 @@ app.all('*', async (req, res) => {
     res.set('cache-control', 'public, max-age=86400');
     if (!r.body) return res.end();
     Readable.fromWeb(r.body).pipe(res);
-  } catch (e) {
+  } catch {
     res.status(502).send('<h1>502</h1><p>upstream error</p>');
-  } finally {
-    clearTimeout(timer);
-  }
+  } finally { clearTimeout(timer); }
 });
 
 app.listen(PORT, () => console.log('proxy listening on ' + PORT));
