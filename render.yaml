@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: manga
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "20.18.0"
+      # 任意: 特定ホストだけ許可したい場合
+      # - key: UPSTREAM_ALLOW
+      #   value: "mangaruu.com,miuraw.net,soraraw.com"
