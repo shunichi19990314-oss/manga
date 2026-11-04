@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: mangaruu-proxy
+    name: miuraw-proxy
     runtime: node
     plan: free
     region: singapore
@@ -12,5 +12,5 @@ services:
         value: 20.18.0
       - key: BLOCK_ADS
         value: "1"
-      - key: TIMEOUT_MS
-        value: "25000"
+      - key: DIRECT_IMG
+        value: "0"
