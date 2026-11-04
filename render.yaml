@@ -12,3 +12,5 @@ services:
         value: 20.11.1
       - key: TARGET_ORIGIN
         value: https://miuraw.net
+      - key: TARGET_FALLBACK
+        value: https://miuraw.com
