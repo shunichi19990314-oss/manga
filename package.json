@@ -1,5 +1,5 @@
 {
-  "name": "mangaruu-proxy",
+  "name": "miuraw-proxy",
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
