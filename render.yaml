@@ -9,8 +9,6 @@ services:
     healthCheckPath: /__health
     envVars:
       - key: NODE_VERSION
-        value: 20.18.0
-      - key: BLOCK_ADS
-        value: "1"
-      - key: DIRECT_IMG
-        value: "0"
+        value: 20.11.1
+      - key: TARGET_ORIGIN
+        value: https://miuraw.net
