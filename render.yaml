@@ -1,14 +1,16 @@
 services:
   - type: web
-    name: manga-clean
+    name: mangaruu-proxy
     runtime: node
     plan: free
-    buildCommand: npm install --no-audit --no-fund
+    region: singapore
+    buildCommand: npm install
     startCommand: npm start
-    healthCheckPath: /healthz
+    healthCheckPath: /__health
     envVars:
       - key: NODE_VERSION
-        value: "20.18.0"
-      # 任意: 特定ホストだけ許可する場合
-      # - key: UPSTREAM_ALLOW
-      #   value: "mangaruu.com,miuraw.net,soraraw.com"
+        value: 20.18.0
+      - key: BLOCK_ADS
+        value: "1"
+      - key: TIMEOUT_MS
+        value: "25000"
